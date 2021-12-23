@@ -1,0 +1,211 @@
+---
+title: "508HW6"
+author: "Hanpu Yao"
+date: "12/21/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#
+```{r}
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(tigris)
+library(gganimate)
+library(riem)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(tidycensus)
+
+options(tigris_class = "sf")
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+palette5 <- c("#eff3ff","#bdd7e7","#6baed6","#3182bd","#08519c")
+palette4 <- c("#D2FBD4","#92BCAB","#527D82","#123F5A")
+palette2 <- c("#6baed6","#08519c")
+
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+
+```
+
+# 2. Data wrangling
+
+## 2.1 Load data
+
+Here I load bike data and trim them to necessary information, such as time and location of start and end of every trip, and its duration. Other data loaded here are weather, 
+
+```{r}
+# Ride data
+ride_0 <- read.csv("202111-capitalbikeshare-tripdata.csv") %>% 
+  rbind(read.csv("202110-capitalbikeshare-tripdata.csv"))
+
+# Trim 
+ride_1 <- ride_0 %>% 
+  dplyr::select(started_at, ended_at, start_station_id,start_lat, start_lng, end_station_id, end_lat, end_lng)
+
+# change time formate and get duration
+ride_1 <- ride_1 %>%   
+  mutate(interval60 = floor_date(ymd_hms(started_at), unit = "hour"),
+         interval15 = floor_date(ymd_hms(started_at), unit = "15 mins"),
+         duration = ymd_hms(ended_at) - ymd_hms(started_at),
+         duration_1 = seconds_to_period(duration),
+         week = week(interval60),
+         dotw = wday(interval60, label=TRUE))
+
+# Only 5 week data needed
+ride_1 <- ride_1 %>%   
+  filter(started_at >= as.POSIXlt("2021-10-09 00:00:00") & started_at <= as.POSIXlt("2021-11-09 23:59:59"))
+
+#
+ride_1 <- ride_1 %>% 
+  na.omit %>% 
+  st_as_sf( coords = c("start_lng", "start_lat"), crs = 4326)
+
+weather.Data <- 
+  riem_measures(station = "DCA", date_start = "2021-10-06", date_end = "2021-11-09")
+
+weather.Panel <-  
+  weather.Data %>%
+    mutate_if(is.character, list(~replace(as.character(.), is.na(.), "0"))) %>% 
+    replace(is.na(.), 0) %>%
+    mutate(interval60 = ymd_h(substr(valid, 1, 13))) %>%
+    mutate(week = week(interval60),
+           dotw = wday(interval60, label=TRUE)) %>%
+    group_by(interval60) %>%
+    summarize(Temperature = max(tmpf),
+              Percipitation = sum(p01i),
+              Wind_Speed = max(sknt)) %>%
+    mutate(Temperature = ifelse(Temperature == 0, 42, Temperature))
+
+```
+
+
+```{r fig.height=4, fig.width=6}
+
+grid.arrange(top = "Weather Data - Washington DC - Oct.3 ~ Nov.6, 2021",
+  ggplot(weather.Panel, aes(interval60,Percipitation)) + geom_line(color=palette2[1]) + 
+    labs(title="Percipitation", x="Hour", y="Percipitation") + plotTheme(),
+  ggplot(weather.Panel, aes(interval60,Wind_Speed)) + geom_line(color=palette2[1]) + 
+    labs(title="Wind Speed", x="Hour", y="Wind Speed") + plotTheme(),
+  ggplot(weather.Panel, aes(interval60,Temperature)) + geom_line(color=palette2[1]) + 
+    labs(title="Temperature", x="Hour", y="Temperature") + plotTheme())
+
+```
+```{r}
+# census data
+census_api_key("e79f3706b6d61249968c6ce88794f6f556e5bf3d", overwrite = TRUE, install = TRUE)
+
+bg <- 
+  get_acs(geography = "block group", 
+          variables = c("B01003_001", "B19013_001", 
+                        "B02001_002", "B08013_001",
+                        "B08012_001", "B08301_001", 
+                        "B08301_010", "B01002_001"), 
+          year = 2019, 
+          state = '11',     
+          geometry = TRUE, 
+          county = '001',   
+          output = "wide") %>%
+  rename(Total_Pop =  B01003_001E,
+         Med_Inc = B19013_001E,
+         Med_Age = B01002_001E,
+         White_Pop = B02001_002E,
+         Travel_Time = B08013_001E,
+         Num_Commuters = B08012_001E,
+         Means_of_Transport = B08301_001E,
+         Total_Public_Trans = B08301_010E) %>%
+  dplyr::select(Total_Pop, Med_Inc, White_Pop, Travel_Time,
+                Means_of_Transport, Total_Public_Trans,
+                Med_Age, GEOID, geometry) %>%
+  mutate(Percent_White = White_Pop / Total_Pop,
+         Mean_Commute_Time = Travel_Time / Total_Public_Trans,
+         Percent_Taking_Public_Trans = Total_Public_Trans / Means_of_Transport) %>%  
+  dplyr::select(Percent_White,Mean_Commute_Time,Percent_Taking_Public_Trans,geometry) %>% 
+  st_transform(4326)
+ride_2 <- st_join(ride_1, bg) 
+
+ggplot()+
+  geom_sf(data = bg)
+```
+
+```{r}
+
+study.panel <- 
+  expand.grid(interval30 = unique(ride_2$interval60), 
+              start_station_id = unique(ride_2$start_station_id)) 
+
+nrow(study.panel)    # chekc number of row to see if my laptop is able to calculate
+
+```
+
+
+```{r}
+#ride panel
+
+# Set memory size
+# Sys.setenv('R_MAX_VSIZE'=32000000000)
+
+ride_2 <- 
+  ride_2 %>%
+    mutate(Trip_Counter = 1) 
+
+ride.panel <- 
+  ride_2 %>% 
+      group_by(interval60, start_station_id) %>%
+      summarize(Trip_Count = sum(Trip_Counter, na.rm=T)) 
+
+ride.panel <- ride.panel %>% 
+      left_join(weather.Panel, by = "interval60") %>%
+          mutate(week = week(interval60),
+                 dotw = wday(interval60, label = TRUE)) %>%
+          st_sf()
+```
+
+```{r}
+ride.panel <- 
+  ride.panel %>% 
+    arrange(start_station_id, interval60) %>% 
+    group_by(start_station_id) %>% 
+    mutate(lagHour = dplyr::lag(Trip_Count,1),
+           lag2Hours = dplyr::lag(Trip_Count,2),
+           lag3Hours = dplyr::lag(Trip_Count,3),
+           lag4Hours = dplyr::lag(Trip_Count,4),
+           lag12Hours = dplyr::lag(Trip_Count,12),
+           lag1day = dplyr::lag(Trip_Count,24)) %>% 
+   ungroup()
+
+ggplot()+
+  geom_sf(data = bg)
+```
+```{r fig.height=2, fig.width=6}
+ride.Train <- filter(ride.panel, week <=43)
+ride.Test <- filter(ride.panel, week >= 44)
+
+ride.panel$week %>% unique
+
+mondays <- 
+  mutate(ride.panel,
+         monday = ifelse(dotw == "Mon" & hour(interval60) == 1,
+                         interval60, 0)) %>%
+  filter(monday != 0) 
+
+
+a <- rbind(
+  mutate(ride.Train, Legend = "Training"), 
+  mutate(ride.Test, Legend = "Testing")) %>%
+    group_by(Legend, interval60) %>% 
+      summarize(Trip_Count = sum(Trip_Count)) #%>%
+      ungroup() %>% 
+      ggplot(aes(interval60, Trip_Count, colour = Legend)) + geom_line() +
+        scale_colour_manual(values = palette2) +
+       geom_vline(data = mondays, aes(xintercept = monday)) +
+        labs(title="Rideshare trips by week: October-November",
+             x="Day", y="Trip Count") +
+        plotTheme() + theme(panel.grid.major = element_blank())   
+```
+
